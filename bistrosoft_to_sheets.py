@@ -229,20 +229,20 @@ def _parse_monto(valor):
 def calcular_stock_minimo(transacciones_ws):
     """
     Calcula stock mínimo diario por artículo por local.
-    Fórmula: promedio qty de los últimos 2 MISMOS DÍAS DE LA SEMANA × 2.
-    Ejemplo: si hoy es sábado, promedia los 2 sábados más recientes con datos.
-    Retorna lista de dicts ordenada por local → stock_minimo desc.
+    Fórmula: (total qty del período / días en rango) × 2.
+    NOTA: la API de Bistrosoft devuelve todas las fechas iguales (la más
+    reciente del rango), así que no podemos diferenciar por día real.
+    Usamos el total acumulado dividido por la cantidad de días del rango.
     """
-    _DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+    DIAS_RANGO = 15  # ventana de consulta
 
-    # {(shop, product): {fecha_key: qty}}
-    ventas = defaultdict(lambda: defaultdict(float))
+    # {(shop, product): total_qty}
+    ventas = defaultdict(float)
 
     for t in transacciones_ws:
         tipo = str(t.get("transaction_type") or t.get("transactionType") or t.get("Tipo") or "").strip()
         product = str(t.get("product") or t.get("Producto") or "").strip()
         shop = str(t.get("shop") or t.get("Local") or "").strip()
-        fecha_str = str(t.get("date") or t.get("Fecha") or "").strip()
         qty = 0
         try:
             qty = float(t.get("quantity") or t.get("Cantidad") or t.get("qty") or 0)
@@ -251,50 +251,26 @@ def calcular_stock_minimo(transacciones_ws):
 
         if "ITEM" not in tipo.upper():
             continue
-        if not product or product == "-" or not shop or not fecha_str:
+        if not product or product == "-" or not shop:
             continue
         if qty <= 0:
             continue
 
-        fecha_dt = _parse_fecha(fecha_str)
-        if not fecha_dt:
-            continue
-
-        fecha_key = fecha_dt.strftime("%Y-%m-%d")
-        ventas[(shop, product)][fecha_key] += qty
-
-    # Determinar el día de la semana de hoy (0=lunes … 6=domingo)
-    hoy = datetime.today()
-    dow_hoy = hoy.weekday()
-    dia_nombre = _DIAS_SEMANA[dow_hoy]
+        ventas[(shop, product)] += qty
 
     resultado = []
-    for (shop, product), fechas_dict in ventas.items():
-        # Filtrar solo las fechas que caen en el MISMO día de la semana que hoy
-        fechas_mismo_dow = [
-            f for f in fechas_dict.keys()
-            if datetime.strptime(f, "%Y-%m-%d").weekday() == dow_hoy
-        ]
-        # Tomar los últimos 2 de ese día de la semana
-        fechas_ordenadas = sorted(fechas_mismo_dow, reverse=True)[:2]
-
-        if not fechas_ordenadas:
-            continue
-
-        total_qty = sum(fechas_dict[f] for f in fechas_ordenadas)
-        num_dias = len(fechas_ordenadas)
-        promedio = total_qty / num_dias if num_dias > 0 else 0
-        stock_min = round(promedio * 2)  # × 2, redondeado a entero
+    for (shop, product), total_qty in ventas.items():
+        promedio_diario = total_qty / DIAS_RANGO
+        stock_min = round(promedio_diario * 2)
         if stock_min <= 0:
             continue
         resultado.append({
             "local": shop,
             "producto": product,
-            "prom_qty_2d": round(promedio, 1),
+            "prom_qty_diario": round(promedio_diario, 1),
             "stock_minimo": stock_min,
-            "dias_con_datos": num_dias,
-            "dia_semana": dia_nombre,
-            "fechas_usadas": ", ".join(fechas_ordenadas),
+            "total_qty": round(total_qty, 1),
+            "dias_rango": DIAS_RANGO,
         })
 
     resultado.sort(key=lambda r: (r["local"], -r["stock_minimo"]))
@@ -326,8 +302,8 @@ COLS_TRANS_DISPLAY = [
 ]
 
 COLS_STOCK_MIN = [
-    "Local", "Producto", "Prom. Qty (últ. 2 mismo día)",
-    "Stock Mínimo", "Días c/Datos", "Día Semana", "Fechas Base",
+    "Local", "Producto", "Prom. Qty Diario",
+    "Stock Mínimo", "Qty Total (15d)", "Días Rango",
 ]
 
 
@@ -530,8 +506,8 @@ def actualizar_promedios_en_sheets(sh):
 
     filas = []
     # Título
-    filas.append(["STOCK MÍNIMO DIARIO POR LOCAL", "", "", "", "", "", ""])
-    filas.append(["Fórmula: promedio qty últimos 2 mismos días de la semana × 2", "", "", "", "", "", ""])
+    filas.append(["STOCK MÍNIMO DIARIO POR LOCAL", "", "", "", "", ""])
+    filas.append(["Fórmula: (qty total 15 días / 15) × 2", "", "", "", "", ""])
     filas.append([""])
 
     # Header
@@ -542,16 +518,15 @@ def actualizar_promedios_en_sheets(sh):
     for item in stock_data:
         if item["local"] != current_local:
             if current_local is not None:
-                filas.append(["", "", "", "", "", "", ""])  # separador entre locales
+                filas.append(["", "", "", "", "", ""])  # separador entre locales
             current_local = item["local"]
         filas.append([
             item["local"],
             item["producto"],
-            item["prom_qty_2d"],
+            item["prom_qty_diario"],
             item["stock_minimo"],
-            item["dias_con_datos"],
-            item["dia_semana"],
-            item["fechas_usadas"],
+            item["total_qty"],
+            item["dias_rango"],
         ])
 
     # ── Escribir al sheet ──
@@ -657,24 +632,13 @@ def main():
             print(f"[{now()}] 🗓 Ventana 15 días: {fecha_desde} → {fecha_hasta}")
 
         # ── Descargar transacciones ──
-        # NOTA: la API de Bistrosoft devuelve todos los registros con la
-        # fecha del extremo más reciente cuando se consulta un rango
-        # multi-día.  Por eso iteramos día por día.
-        if MODO_BACKFILL or FECHA_ESPECIFICA:
-            transacciones = descargar_transacciones(token, fecha_desde, fecha_hasta)
-        else:
-            # Ventana de 15 días — iterar día por día
-            fecha_desde_dt = hoy - timedelta(days=15)
-            transacciones = []
-            total_dias = 16  # 0..15 inclusive
-            for i in range(total_dias):
-                dia = (fecha_desde_dt + timedelta(days=i)).strftime("%Y-%m-%d")
-                print(f"[{now()}] 📆 Día {i+1}/{total_dias}: {dia}")
-                trans_dia = descargar_transacciones(token, dia, dia)
-                transacciones.extend(trans_dia)
-                if i < total_dias - 1:
-                    time.sleep(2)  # cortesía entre días
-            print(f"[{now()}] ✅ Total acumulado 15 días: {len(transacciones)} transacciones")
+        # NOTA: la API de Bistrosoft NO soporta consultas de un solo día
+        # (startDate = endDate devuelve 0).  Se debe usar rango multi-día.
+        # La API puede devolver todos los registros con la fecha del
+        # extremo más reciente; por eso confiamos en el campo "date" tal
+        # cual viene.
+        transacciones = descargar_transacciones(token, fecha_desde, fecha_hasta)
+        print(f"[{now()}] ✅ Total descargado: {len(transacciones)} transacciones")
 
         if not transacciones:
             print(f"[{now()}] ⚠️ 0 registros — Bistrosoft no tiene datos para esta ventana.")
