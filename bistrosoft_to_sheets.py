@@ -229,9 +229,12 @@ def _parse_monto(valor):
 def calcular_stock_minimo(transacciones_ws):
     """
     Calcula stock mínimo diario por artículo por local.
-    Fórmula: promedio qty de los últimos 2 días con datos × 2.
+    Fórmula: promedio qty de los últimos 2 MISMOS DÍAS DE LA SEMANA × 2.
+    Ejemplo: si hoy es sábado, promedia los 2 sábados más recientes con datos.
     Retorna lista de dicts ordenada por local → stock_minimo desc.
     """
+    _DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+
     # {(shop, product): {fecha_key: qty}}
     ventas = defaultdict(lambda: defaultdict(float))
 
@@ -260,22 +263,37 @@ def calcular_stock_minimo(transacciones_ws):
         fecha_key = fecha_dt.strftime("%Y-%m-%d")
         ventas[(shop, product)][fecha_key] += qty
 
+    # Determinar el día de la semana de hoy (0=lunes … 6=domingo)
+    hoy = datetime.today()
+    dow_hoy = hoy.weekday()
+    dia_nombre = _DIAS_SEMANA[dow_hoy]
+
     resultado = []
     for (shop, product), fechas_dict in ventas.items():
-        # Tomar los últimos 2 días con datos
-        fechas_ordenadas = sorted(fechas_dict.keys(), reverse=True)[:2]
-        total_qty_2d = sum(fechas_dict[f] for f in fechas_ordenadas)
+        # Filtrar solo las fechas que caen en el MISMO día de la semana que hoy
+        fechas_mismo_dow = [
+            f for f in fechas_dict.keys()
+            if datetime.strptime(f, "%Y-%m-%d").weekday() == dow_hoy
+        ]
+        # Tomar los últimos 2 de ese día de la semana
+        fechas_ordenadas = sorted(fechas_mismo_dow, reverse=True)[:2]
+
+        if not fechas_ordenadas:
+            continue
+
+        total_qty = sum(fechas_dict[f] for f in fechas_ordenadas)
         num_dias = len(fechas_ordenadas)
-        promedio_2d = total_qty_2d / num_dias if num_dias > 0 else 0
-        stock_min = round(promedio_2d * 2)  # × 2, redondeado a entero
+        promedio = total_qty / num_dias if num_dias > 0 else 0
+        stock_min = round(promedio * 2)  # × 2, redondeado a entero
         if stock_min <= 0:
             continue
         resultado.append({
             "local": shop,
             "producto": product,
-            "prom_qty_2d": round(promedio_2d, 1),
+            "prom_qty_2d": round(promedio, 1),
             "stock_minimo": stock_min,
-            "dias_con_datos": len(fechas_dict),
+            "dias_con_datos": num_dias,
+            "dia_semana": dia_nombre,
             "fechas_usadas": ", ".join(fechas_ordenadas),
         })
 
@@ -308,8 +326,8 @@ COLS_TRANS_DISPLAY = [
 ]
 
 COLS_STOCK_MIN = [
-    "Local", "Producto", "Prom. Qty (últ. 2 días)",
-    "Stock Mínimo", "Días c/Datos", "Fechas Base",
+    "Local", "Producto", "Prom. Qty (últ. 2 mismo día)",
+    "Stock Mínimo", "Días c/Datos", "Día Semana", "Fechas Base",
 ]
 
 
@@ -340,17 +358,10 @@ def _format_header(ws, num_cols, color_bg=None, color_fg=None):
 
 
 def _format_alternating_rows(ws, num_rows, num_cols):
-    """Aplica colores alternados a las filas de datos."""
-    if num_rows <= 1:
-        return
-    col_letter = chr(ord('A') + num_cols - 1)
-    # Filas pares (2, 4, 6...)
-    for idx, i in enumerate(range(2, num_rows + 1, 2)):
-        ws.format(f"A{i}:{col_letter}{i}", {
-            "backgroundColor": COLOR_ROW_EVEN,
-        })
-        if (idx + 1) % 10 == 0:
-            time.sleep(3)
+    """Aplica colores alternados a las filas de datos.
+    DESHABILITADO: cada fila genera 1 API call, excede rate limit de Google Sheets.
+    """
+    return  # Skip para evitar 429 rate limit
 
 
 def _format_number_cols(ws, col_indices, num_rows):
@@ -519,8 +530,8 @@ def actualizar_promedios_en_sheets(sh):
 
     filas = []
     # Título
-    filas.append(["STOCK MÍNIMO DIARIO POR LOCAL", "", "", "", "", ""])
-    filas.append(["Fórmula: promedio qty últimos 2 días × 2", "", "", "", "", ""])
+    filas.append(["STOCK MÍNIMO DIARIO POR LOCAL", "", "", "", "", "", ""])
+    filas.append(["Fórmula: promedio qty últimos 2 mismos días de la semana × 2", "", "", "", "", "", ""])
     filas.append([""])
 
     # Header
@@ -531,7 +542,7 @@ def actualizar_promedios_en_sheets(sh):
     for item in stock_data:
         if item["local"] != current_local:
             if current_local is not None:
-                filas.append(["", "", "", "", "", ""])  # separador entre locales
+                filas.append(["", "", "", "", "", "", ""])  # separador entre locales
             current_local = item["local"]
         filas.append([
             item["local"],
@@ -539,6 +550,7 @@ def actualizar_promedios_en_sheets(sh):
             item["prom_qty_2d"],
             item["stock_minimo"],
             item["dias_con_datos"],
+            item["dia_semana"],
             item["fechas_usadas"],
         ])
 
@@ -593,13 +605,8 @@ def actualizar_promedios_en_sheets(sh):
             "horizontalAlignment": "CENTER",
         })
 
-    # Colorear filas alternadas (con pausa cada 10 filas para evitar rate limit)
-    for idx, i in enumerate(range(header_row + 1, data_end + 1, 2)):
-        ws.format(f"A{i}:{col_end}{i}", {
-            "backgroundColor": COLOR_ROW_EVEN,
-        })
-        if (idx + 1) % 10 == 0:
-            time.sleep(3)
+    # Colorear filas alternadas — DESHABILITADO (excede rate limit)
+    # Se omite zebra-striping para no superar 60 writes/min de Google Sheets API
 
     # Resaltar columna Stock Mínimo con fondo amarillo claro
     if data_end > header_row:
@@ -646,10 +653,28 @@ def main():
             fecha_desde = FECHA_ESPECIFICA
             print(f"[{now()}] 🗓 Fecha específica: {fecha_desde} → {fecha_hasta}")
         else:
-            fecha_desde = (hoy - timedelta(days=2)).strftime("%Y-%m-%d")
-            print(f"[{now()}] 🗓 Ventana diaria: {fecha_desde} → {fecha_hasta}")
+            fecha_desde = (hoy - timedelta(days=15)).strftime("%Y-%m-%d")
+            print(f"[{now()}] 🗓 Ventana 15 días: {fecha_desde} → {fecha_hasta}")
 
-        transacciones = descargar_transacciones(token, fecha_desde, fecha_hasta)
+        # ── Descargar transacciones ──
+        # NOTA: la API de Bistrosoft devuelve todos los registros con la
+        # fecha del extremo más reciente cuando se consulta un rango
+        # multi-día.  Por eso iteramos día por día.
+        if MODO_BACKFILL or FECHA_ESPECIFICA:
+            transacciones = descargar_transacciones(token, fecha_desde, fecha_hasta)
+        else:
+            # Ventana de 15 días — iterar día por día
+            fecha_desde_dt = hoy - timedelta(days=15)
+            transacciones = []
+            total_dias = 16  # 0..15 inclusive
+            for i in range(total_dias):
+                dia = (fecha_desde_dt + timedelta(days=i)).strftime("%Y-%m-%d")
+                print(f"[{now()}] 📆 Día {i+1}/{total_dias}: {dia}")
+                trans_dia = descargar_transacciones(token, dia, dia)
+                transacciones.extend(trans_dia)
+                if i < total_dias - 1:
+                    time.sleep(2)  # cortesía entre días
+            print(f"[{now()}] ✅ Total acumulado 15 días: {len(transacciones)} transacciones")
 
         if not transacciones:
             print(f"[{now()}] ⚠️ 0 registros — Bistrosoft no tiene datos para esta ventana.")
@@ -667,21 +692,9 @@ def main():
             print(f"[{now()}] ❌ No se encontraron fechas válidas.")
             return
 
-        # Filtrar registros según el modo
-        if MODO_BACKFILL:
-            print(f"[{now()}] 📅 Backfill: procesando {len(fechas_validas)} día(s)")
-        else:
-            try:
-                fecha_objetivo_dt = max(datetime.strptime(f, "%d-%m-%Y") for f in fechas_validas)
-                fecha_objetivo = fecha_objetivo_dt.strftime("%d-%m-%Y")
-            except Exception:
-                fecha_objetivo = fechas_validas[0]
-
-            trans_filtradas = [t for t in transacciones if t.get("date", "") == fecha_objetivo]
-            descartados = len(transacciones) - len(trans_filtradas)
-            print(f"[{now()}] 📅 Día objetivo: {fecha_objetivo} — "
-                  f"{len(trans_filtradas)} registros ({descartados} de otros días descartados)")
-            transacciones = trans_filtradas
+        # En modo 15 días y backfill procesamos TODOS los días
+        print(f"[{now()}] 📅 Procesando {len(fechas_validas)} día(s), "
+              f"{len(transacciones)} registros totales")
 
         # Calcular resumen
         resumen = calcular_resumen(transacciones)
