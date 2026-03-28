@@ -35,7 +35,7 @@ GOOGLE_SHEET_ID = "1s6kPguwD25k3xpmbUoHq1KNFd_SEva3z7pvTGhA4bsE"
 
 GOOGLE_SHEET_TAB_TRANS = "Transacciones"
 GOOGLE_SHEET_TAB_RESUMEN = "Resumen"
-GOOGLE_SHEET_TAB_PROMEDIO = "Promedio x Día"
+GOOGLE_SHEET_TAB_PROMEDIO = "Vta Promedio x Día"
 
 # Día a consultar en modo normal.  None = ayer automáticamente.
 FECHA_ESPECIFICA = None
@@ -189,25 +189,80 @@ DIAS_SEMANA_ES = {
     0: "Lunes", 1: "Martes", 2: "Miércoles",
     3: "Jueves", 4: "Viernes", 5: "Sábado", 6: "Domingo",
 }
+DIAS_SEMANA_ORDER = [0, 1, 2, 3, 4, 5, 6]
 
-def calcular_promedios_por_dia(transacciones_ws):
+
+def _parse_fecha(fecha_str):
+    """Intenta parsear fecha en varios formatos. Retorna datetime o None."""
+    for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(fecha_str.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def calcular_vta_promedio_por_dia(resumen_ws):
     """
-    Lee TODAS las transacciones históricas del worksheet Transacciones,
-    más las nuevas que se van a escribir, y calcula:
-      - Por cada (día_semana, local, producto): cantidad promedio vendida.
-    Solo cuenta items con transaction_type = 'ITEM' o similar (no Comanda/Caja).
+    A partir del historial de Resumen (ventas_brutas por fecha/local),
+    calcula la venta promedio $ por día de semana por local.
+    Retorna: {shop: {dia_num: {"promedio": X, "num_dias": N, "fechas": [...]}}}
     """
-    # Estructura: {(dia_semana_num, shop, product): {fecha: qty_total}}
+    # {(shop, dia_num): {fecha_key: monto}}
+    ventas = defaultdict(lambda: defaultdict(float))
+
+    for r in resumen_ws:
+        fecha_str = str(r.get("date", "") or r.get("Fecha", ""))
+        shop = str(r.get("shop", "") or r.get("Local", ""))
+        monto = r.get("ventas_brutas", 0) or r.get("Ventas Brutas $", 0)
+        try:
+            monto = float(str(monto).replace("$", "").replace(",", "").strip() or 0)
+        except (ValueError, TypeError):
+            monto = 0
+
+        if not fecha_str or not shop or monto <= 0:
+            continue
+
+        fecha_dt = _parse_fecha(fecha_str)
+        if not fecha_dt:
+            continue
+
+        dia_num = fecha_dt.weekday()
+        fecha_key = fecha_dt.strftime("%Y-%m-%d")
+        ventas[(shop, dia_num)][fecha_key] += monto
+
+    # Agrupar por shop
+    resultado = defaultdict(dict)
+    for (shop, dia_num), fechas_dict in ventas.items():
+        total = sum(fechas_dict.values())
+        num_dias = len(fechas_dict)
+        resultado[shop][dia_num] = {
+            "promedio": round(total / num_dias, 2) if num_dias > 0 else 0,
+            "num_dias": num_dias,
+        }
+
+    return resultado
+
+
+def calcular_vta_promedio_por_articulo(transacciones_ws):
+    """
+    Calcula venta promedio de qty por artículo por local por día de semana.
+    Retorna lista de dicts ordenada por local → producto.
+    """
+    # {(shop, product): {fecha_key: qty}}
     ventas = defaultdict(lambda: defaultdict(float))
 
     for t in transacciones_ws:
-        tipo = str(t.get("transaction_type") or t.get("transactionType") or "").strip()
-        product = str(t.get("product") or "").strip()
-        shop = str(t.get("shop") or "").strip()
-        fecha_str = str(t.get("date") or "").strip()
-        qty = float(t.get("quantity") or t.get("qty") or 0)
+        tipo = str(t.get("transaction_type") or t.get("transactionType") or t.get("Tipo") or "").strip()
+        product = str(t.get("product") or t.get("Producto") or "").strip()
+        shop = str(t.get("shop") or t.get("Local") or "").strip()
+        fecha_str = str(t.get("date") or t.get("Fecha") or "").strip()
+        qty = 0
+        try:
+            qty = float(t.get("quantity") or t.get("Cantidad") or t.get("qty") or 0)
+        except (ValueError, TypeError):
+            qty = 0
 
-        # Solo items vendidos con producto real
         if "ITEM" not in tipo.upper():
             continue
         if not product or product == "-" or not shop or not fecha_str:
@@ -215,30 +270,19 @@ def calcular_promedios_por_dia(transacciones_ws):
         if qty <= 0:
             continue
 
-        # Parsear fecha para obtener día de semana
-        try:
-            fecha_dt = datetime.strptime(fecha_str, "%d-%m-%Y")
-        except ValueError:
-            try:
-                fecha_dt = datetime.strptime(fecha_str, "%Y-%m-%d")
-            except ValueError:
-                continue
+        fecha_dt = _parse_fecha(fecha_str)
+        if not fecha_dt:
+            continue
 
-        dia_semana = fecha_dt.weekday()  # 0=Lunes
         fecha_key = fecha_dt.strftime("%Y-%m-%d")
+        ventas[(shop, product)][fecha_key] += qty
 
-        ventas[(dia_semana, shop, product)][fecha_key] += qty
-
-    # Calcular promedios
     resultado = []
-    for (dia_num, shop, product), fechas_dict in ventas.items():
+    for (shop, product), fechas_dict in ventas.items():
         total_qty = sum(fechas_dict.values())
         num_dias = len(fechas_dict)
         promedio = round(total_qty / num_dias, 1) if num_dias > 0 else 0
-
         resultado.append({
-            "dia_semana_num": dia_num,
-            "dia_semana": DIAS_SEMANA_ES[dia_num],
             "local": shop,
             "producto": product,
             "promedio_qty": promedio,
@@ -246,8 +290,7 @@ def calcular_promedios_por_dia(transacciones_ws):
             "dias_con_venta": num_dias,
         })
 
-    # Ordenar: día semana → local → producto
-    resultado.sort(key=lambda r: (r["dia_semana_num"], r["local"], r["producto"]))
+    resultado.sort(key=lambda r: (r["local"], -r["promedio_qty"]))
     return resultado
 
 
@@ -275,9 +318,9 @@ COLS_TRANS_DISPLAY = [
     "Cantidad", "Cliente", "Mozo", "Mesa", "Categoría",
 ]
 
-COLS_PROMEDIO = [
-    "Día", "Local", "Producto", "Promedio Qty/Día",
-    "Total Vendido", "Días con Venta",
+COLS_PROMEDIO_ART = [
+    "Producto", "Local", "Prom. Qty/Día",
+    "Total Vendido", "Días c/Venta",
 ]
 
 
@@ -463,97 +506,177 @@ def actualizar_transacciones_en_sheets(transacciones, sh):
 
 def actualizar_promedios_en_sheets(sh):
     """
-    Lee TODO el histórico de Transacciones y calcula promedios por día/local/producto.
-    Escribe en la pestaña 'Promedio x Día'.
+    Lee el histórico de Resumen + Transacciones y genera la pestaña pivot
+    'Vta Promedio x Día' con dos secciones:
+      1. Tabla pivot: Local × Día de semana (venta $ promedio)
+      2. Detalle por artículo: promedio qty vendida por producto/local
     """
     print(f"[{now()}] 📊 Calculando promedios por día de semana...")
 
-    # Leer todas las transacciones históricas
+    # ── Leer historial de Resumen para ventas brutas por día ──
+    try:
+        ws_res = sh.worksheet(GOOGLE_SHEET_TAB_RESUMEN)
+        all_resumen = ws_res.get_all_records()
+    except Exception as e:
+        print(f"[{now()}] ⚠️ No se pudo leer Resumen para promedios: {e}")
+        all_resumen = []
+
+    # ── Leer historial de Transacciones para detalle por artículo ──
     try:
         ws_trans = sh.worksheet(GOOGLE_SHEET_TAB_TRANS)
         all_trans = ws_trans.get_all_records()
     except Exception as e:
         print(f"[{now()}] ⚠️ No se pudo leer Transacciones para promedios: {e}")
+        all_trans = []
+
+    if not all_resumen and not all_trans:
+        print(f"[{now()}] ⚠️ Sin datos para calcular promedios")
         return
 
-    if not all_trans:
-        print(f"[{now()}] ⚠️ Sin transacciones para calcular promedios")
-        return
+    # ── SECCIÓN 1: Pivot de Venta Promedio $ por Local × Día ──
+    vta_por_dia = calcular_vta_promedio_por_dia(all_resumen)
+    shops = sorted(vta_por_dia.keys())
 
-    # Normalizar keys (pueden venir con display names)
-    normalized = []
-    for t in all_trans:
-        normalized.append({
-            "date": t.get("date", "") or t.get("Fecha", ""),
-            "shop": t.get("shop", "") or t.get("Local", ""),
-            "transaction_type": t.get("transaction_type", "") or t.get("Tipo", ""),
-            "product": t.get("product", "") or t.get("Producto", ""),
-            "quantity": t.get("quantity", 0) or t.get("Cantidad", 0),
-        })
+    filas = []
+    # Título sección 1
+    filas.append(["VENTA PROMEDIO $ POR DÍA DE SEMANA", "", "", "", "", "", "", ""])
+    filas.append(["", "", "", "", "", "", "", ""])
 
-    promedios = calcular_promedios_por_dia(normalized)
+    # Header pivot: Local | Lunes | Martes | ... | Domingo
+    header_pivot = ["Local"] + [DIAS_SEMANA_ES[d] for d in DIAS_SEMANA_ORDER]
+    filas.append(header_pivot)
+    pivot_header_row = len(filas)  # fila 3
 
-    if not promedios:
-        print(f"[{now()}] ⚠️ Sin datos de productos para promedios")
-        return
+    for shop in shops:
+        row = [shop]
+        for dia_num in DIAS_SEMANA_ORDER:
+            info = vta_por_dia[shop].get(dia_num)
+            if info and info["promedio"] > 0:
+                row.append(info["promedio"])
+            else:
+                row.append("-")
+        filas.append(row)
 
-    ws = _get_or_create_ws(sh, GOOGLE_SHEET_TAB_PROMEDIO, rows=max(len(promedios) + 50, 2000), cols=10)
+    # Fila con cantidad de días usados para el promedio
+    filas.append([""])  # espacio
+    filas.append(["Basado en:"] + ["" for _ in DIAS_SEMANA_ORDER])
+    for shop in shops:
+        row = [shop]
+        for dia_num in DIAS_SEMANA_ORDER:
+            info = vta_por_dia[shop].get(dia_num)
+            if info and info["num_dias"] > 0:
+                dia_name = DIAS_SEMANA_ES[dia_num][:3].lower()
+                row.append(f"{info['num_dias']} {dia_name}.")
+            else:
+                row.append("-")
+        filas.append(row)
 
-    # Agrupar por día de semana para crear secciones visuales
-    filas = [COLS_PROMEDIO]
-    current_dia = None
-    for p in promedios:
-        if p["dia_semana"] != current_dia:
-            if current_dia is not None:
-                filas.append(["", "", "", "", "", ""])  # Fila separadora
-            current_dia = p["dia_semana"]
+    # ── SECCIÓN 2: Detalle por Artículo ──
+    art_promedios = calcular_vta_promedio_por_articulo(all_trans)
+
+    filas.append([""])
+    filas.append([""])
+    sec2_title_row = len(filas) + 1
+    filas.append(["VENTA PROMEDIO POR ARTÍCULO", "", "", "", ""])
+    filas.append(["", "", "", "", ""])
+    filas.append(COLS_PROMEDIO_ART)
+    art_header_row = len(filas)
+
+    current_local = None
+    for a in art_promedios:
+        if a["local"] != current_local:
+            if current_local is not None:
+                filas.append(["", "", "", "", ""])  # separador
+            current_local = a["local"]
         filas.append([
-            p["dia_semana"],
-            p["local"],
-            p["producto"],
-            p["promedio_qty"],
-            p["total_vendido"],
-            p["dias_con_venta"],
+            a["producto"],
+            a["local"],
+            a["promedio_qty"],
+            a["total_vendido"],
+            a["dias_con_venta"],
         ])
+
+    # ── Escribir al sheet ──
+    total_rows = len(filas) + 10
+    total_cols = max(len(header_pivot), len(COLS_PROMEDIO_ART)) + 1
+    ws = _get_or_create_ws(sh, GOOGLE_SHEET_TAB_PROMEDIO, rows=max(total_rows, 500), cols=total_cols)
 
     ws.clear()
     time.sleep(1)
-    ws.resize(rows=len(filas) + 5, cols=len(COLS_PROMEDIO))
+    ws.resize(rows=total_rows, cols=total_cols)
     ws.update(filas, "A1")
 
-    # Formato visual
+    # ── Formato visual ──
     time.sleep(1)
-    num_cols = len(COLS_PROMEDIO)
-    _format_header(ws, num_cols, color_bg=COLOR_ACCENT, color_fg=COLOR_ACCENT_FG)
 
-    # Formato de columnas numéricas
-    _format_number_cols(ws, [3, 4, 5], len(filas))
+    # Título sección 1 - fondo verde, texto blanco, bold
+    ws.format("A1:H1", {
+        "backgroundColor": COLOR_ACCENT,
+        "textFormat": {"bold": True, "foregroundColor": COLOR_ACCENT_FG, "fontSize": 12},
+    })
 
-    # Colorear filas de separación por día y aplicar colores alternados
-    dia_colors = {
-        "Lunes": COLOR_LIGHT_BLUE,
-        "Martes": COLOR_LIGHT_GREEN,
-        "Miércoles": COLOR_LIGHT_YELLOW,
-        "Jueves": COLOR_LIGHT_BLUE,
-        "Viernes": COLOR_LIGHT_GREEN,
-        "Sábado": COLOR_LIGHT_YELLOW,
-        "Domingo": {"red": 0.95, "green": 0.87, "blue": 0.87},
-    }
+    # Header pivot (fila 3)
+    pivot_cols = len(header_pivot)
+    col_end = chr(ord('A') + pivot_cols - 1)
+    ws.format(f"A{pivot_header_row}:{col_end}{pivot_header_row}", {
+        "backgroundColor": COLOR_HEADER_BG,
+        "textFormat": {"bold": True, "foregroundColor": COLOR_HEADER_FG, "fontSize": 11},
+        "horizontalAlignment": "CENTER",
+    })
 
-    # Freeze header + filter
-    _freeze_and_autofilter(ws, num_cols)
+    # Formato moneda para celdas de datos pivot (filas después del header pivot)
+    data_start = pivot_header_row + 1
+    data_end = pivot_header_row + len(shops)
+    if data_end >= data_start:
+        ws.format(f"B{data_start}:{col_end}{data_end}", {
+            "numberFormat": {"type": "NUMBER", "pattern": "$ #,##0"},
+            "horizontalAlignment": "RIGHT",
+        })
+        # Colorear filas alternadas en la tabla pivot
+        for i in range(data_start, data_end + 1, 2):
+            ws.format(f"A{i}:{col_end}{i}", {
+                "backgroundColor": COLOR_LIGHT_BLUE,
+            })
 
-    # Ajustar anchos de columna (aproximado via formato)
-    ws.format("C:C", {"wrapStrategy": "CLIP"})
+    # "Basado en:" header
+    basado_row = data_end + 2
+    ws.format(f"A{basado_row}:A{basado_row}", {
+        "textFormat": {"bold": True, "italic": True, "fontSize": 10},
+    })
+
+    # Título sección 2
+    ws.format(f"A{sec2_title_row}:E{sec2_title_row}", {
+        "backgroundColor": {"red": 0.16, "green": 0.50, "blue": 0.73},
+        "textFormat": {"bold": True, "foregroundColor": COLOR_ACCENT_FG, "fontSize": 12},
+    })
+
+    # Header artículos
+    ws.format(f"A{art_header_row}:E{art_header_row}", {
+        "backgroundColor": COLOR_HEADER_BG,
+        "textFormat": {"bold": True, "foregroundColor": COLOR_HEADER_FG, "fontSize": 11},
+        "horizontalAlignment": "CENTER",
+    })
+
+    # Formato numérico para columnas C, D, E de artículos
+    art_data_end = len(filas)
+    if art_data_end > art_header_row:
+        ws.format(f"C{art_header_row + 1}:E{art_data_end}", {
+            "numberFormat": {"type": "NUMBER", "pattern": "#,##0.#"},
+            "horizontalAlignment": "RIGHT",
+        })
+
+    # Freeze fila 1
+    ws.freeze(rows=1)
 
     # Timestamp
-    ws.update_cell(len(filas) + 2, 1, f"Última actualización: {now()}")
-    ws.format(f"A{len(filas) + 2}", {
+    ts_row = len(filas) + 2
+    ws.update_cell(ts_row, 1, f"Última actualización: {now()}")
+    ws.format(f"A{ts_row}", {
         "textFormat": {"italic": True, "foregroundColor": {"red": 0.5, "green": 0.5, "blue": 0.5}},
     })
 
-    print(f"[{now()}] ✅ Promedios actualizados — {len(promedios)} filas "
-          f"({len(set(p['dia_semana'] for p in promedios))} días de semana)")
+    print(f"[{now()}] ✅ Promedios actualizados — {len(shops)} locales, "
+          f"{len(art_promedios)} artículos")
 
 
 # ── Main ────────────────────────────────────────────────────────────────────────
