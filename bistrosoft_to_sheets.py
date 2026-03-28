@@ -202,6 +202,36 @@ def _parse_fecha(fecha_str):
     return None
 
 
+def _parse_monto(valor):
+    """Parsea un valor monetario que puede venir como número o string con formato argentino.
+    Maneja: 11524500.0, "$ 11.524.500,00", "11524500", "$11,524,500.00", etc.
+    """
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    s = str(valor).replace("$", "").replace(" ", "").strip()
+    if not s:
+        return 0.0
+    # Detectar formato argentino: "11.524.500,00" (. = miles, , = decimal)
+    if "," in s and "." in s:
+        # Si la coma viene después del último punto → formato argentino
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            # Formato US/internacional: "11,524,500.00"
+            s = s.replace(",", "")
+    elif "," in s:
+        # Solo coma → puede ser decimal argentino "500,50"
+        s = s.replace(",", ".")
+    # Si quedan múltiples puntos, eliminar todos menos el último (miles)
+    parts = s.split(".")
+    if len(parts) > 2:
+        s = "".join(parts[:-1]) + "." + parts[-1]
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def calcular_vta_promedio_por_dia(resumen_ws):
     """
     A partir del historial de Resumen (ventas_brutas por fecha/local),
@@ -214,11 +244,8 @@ def calcular_vta_promedio_por_dia(resumen_ws):
     for r in resumen_ws:
         fecha_str = str(r.get("date", "") or r.get("Fecha", ""))
         shop = str(r.get("shop", "") or r.get("Local", ""))
-        monto = r.get("ventas_brutas", 0) or r.get("Ventas Brutas $", 0)
-        try:
-            monto = float(str(monto).replace("$", "").replace(",", "").strip() or 0)
-        except (ValueError, TypeError):
-            monto = 0
+        monto_raw = r.get("ventas_brutas", 0) or r.get("Ventas Brutas $", 0)
+        monto = _parse_monto(monto_raw)
 
         if not fecha_str or not shop or monto <= 0:
             continue
