@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 bistrosoft_to_sheets.py  — Cronklam / L'Harmonie
 ==============================================================
