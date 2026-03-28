@@ -9,7 +9,7 @@ Arquitectura:
     2. Calcula el resumen diario en Python.
     3. Pestaña "Resumen"        → histórico acumulativo (merge inteligente).
     4. Pestaña "Transacciones"  → detalle del día descargado.
-    5. Pestaña "Stock Mínimo"   → stock mínimo diario = prom. qty últimos 2 días × 2.
+    5. Pestaña "Stock Mínimo"   → stock mínimo POR DÍA DE SEMANA = prom. qty últimos 2 mismos días.
 
 Sin Supabase. Sin VIEW. Sin dedup complejo.
 Basado en el script original de Pomodoro Consulting (Tomás).
@@ -226,23 +226,34 @@ def _parse_monto(valor):
         return 0.0
 
 
+_DIAS_SEMANA = {
+    0: "Lunes", 1: "Martes", 2: "Miércoles",
+    3: "Jueves", 4: "Viernes", 5: "Sábado", 6: "Domingo",
+}
+
+# Orden para mostrar los días en la planilla
+_DIA_ORDEN = {d: i for i, d in enumerate(["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"])}
+
+
 def calcular_stock_minimo(transacciones_ws):
     """
-    Calcula stock mínimo diario por artículo por local.
-    Fórmula: (total qty del período / días en rango) × 2.
-    NOTA: la API de Bistrosoft devuelve todas las fechas iguales (la más
-    reciente del rango), así que no podemos diferenciar por día real.
-    Usamos el total acumulado dividido por la cantidad de días del rango.
+    Calcula stock mínimo POR DÍA DE SEMANA, por artículo, por local.
+    Fórmula:
+      1. Agrupa transacciones por (local, producto, fecha).
+      2. Suma qty por día real.
+      3. Para cada día de semana (Lunes, Martes, …), toma los últimos 2
+         días iguales (ej: los 2 últimos jueves).
+      4. Stock mínimo = suma de esos 2 días / 2 (promedio).
     """
-    DIAS_RANGO = 15  # ventana de consulta
-
-    # {(shop, product): total_qty}
-    ventas = defaultdict(float)
+    # Paso 1: acumular qty por (shop, product, fecha_date)
+    # {(shop, product, date_obj): total_qty}
+    ventas_dia = defaultdict(float)
 
     for t in transacciones_ws:
         tipo = str(t.get("transaction_type") or t.get("transactionType") or t.get("Tipo") or "").strip()
         product = str(t.get("product") or t.get("Producto") or "").strip()
         shop = str(t.get("shop") or t.get("Local") or "").strip()
+        fecha_str = str(t.get("date") or t.get("Fecha") or "").strip()
         qty = 0
         try:
             qty = float(t.get("quantity") or t.get("Cantidad") or t.get("qty") or 0)
@@ -256,24 +267,51 @@ def calcular_stock_minimo(transacciones_ws):
         if qty <= 0:
             continue
 
-        ventas[(shop, product)] += qty
+        fecha_dt = _parse_fecha(fecha_str)
+        if not fecha_dt:
+            continue
 
+        ventas_dia[(shop, product, fecha_dt.date())] += qty
+
+    # Paso 2: agrupar por (shop, product, weekday) → lista de (date, qty)
+    # {(shop, product, weekday_num): [(date, qty), ...]}
+    por_dia_semana = defaultdict(list)
+    for (shop, product, fecha), qty in ventas_dia.items():
+        wd = fecha.weekday()  # 0=Lun … 6=Dom
+        por_dia_semana[(shop, product, wd)].append((fecha, qty))
+
+    # Paso 3: para cada combo, tomar los últimos 2 días y promediar
     resultado = []
-    for (shop, product), total_qty in ventas.items():
-        promedio_diario = total_qty / DIAS_RANGO
-        stock_min = round(promedio_diario * 2)
+    for (shop, product, wd), dias in por_dia_semana.items():
+        # Ordenar por fecha descendente y tomar los 2 más recientes
+        dias.sort(key=lambda x: x[0], reverse=True)
+        ultimos_2 = dias[:2]
+
+        if len(ultimos_2) == 0:
+            continue
+
+        suma = sum(q for _, q in ultimos_2)
+        n = len(ultimos_2)
+        promedio = suma / n
+        stock_min = round(promedio)
+
         if stock_min <= 0:
             continue
+
+        dia_nombre = _DIAS_SEMANA[wd]
+        fechas_usadas = ", ".join(d.strftime("%d/%m") for d, _ in ultimos_2)
+
         resultado.append({
             "local": shop,
             "producto": product,
-            "prom_qty_diario": round(promedio_diario, 1),
+            "dia_semana": dia_nombre,
+            "dia_orden": _DIA_ORDEN[dia_nombre],
             "stock_minimo": stock_min,
-            "total_qty": round(total_qty, 1),
-            "dias_rango": DIAS_RANGO,
+            "fechas_usadas": fechas_usadas,
+            "n_dias": n,
         })
 
-    resultado.sort(key=lambda r: (r["local"], -r["stock_minimo"]))
+    resultado.sort(key=lambda r: (r["local"], r["producto"], r["dia_orden"]))
     return resultado
 
 
@@ -302,8 +340,8 @@ COLS_TRANS_DISPLAY = [
 ]
 
 COLS_STOCK_MIN = [
-    "Local", "Producto", "Prom. Qty Diario",
-    "Stock Mínimo", "Qty Total (15d)", "Días Rango",
+    "Local", "Producto", "Día",
+    "Stock Mínimo", "Fechas Usadas", "# Días",
 ]
 
 
@@ -485,10 +523,10 @@ def actualizar_transacciones_en_sheets(transacciones, sh):
 def actualizar_promedios_en_sheets(sh):
     """
     Lee el histórico de Transacciones y genera la pestaña 'Stock Mínimo'
-    con el stock mínimo diario por artículo por local.
-    Fórmula: promedio qty últimos 2 días × 2.
+    con el stock mínimo POR DÍA DE SEMANA, por artículo, por local.
+    Fórmula: promedio qty de los últimos 2 mismos días de semana.
     """
-    print(f"[{now()}] 📊 Calculando stock mínimo por artículo/local...")
+    print(f"[{now()}] 📊 Calculando stock mínimo por día de semana / artículo / local...")
 
     # ── Leer historial de Transacciones ──
     try:
@@ -506,8 +544,8 @@ def actualizar_promedios_en_sheets(sh):
 
     filas = []
     # Título
-    filas.append(["STOCK MÍNIMO DIARIO POR LOCAL", "", "", "", "", ""])
-    filas.append(["Fórmula: (qty total 15 días / 15) × 2", "", "", "", "", ""])
+    filas.append(["STOCK MÍNIMO POR DÍA DE SEMANA", "", "", "", "", ""])
+    filas.append(["Promedio qty últimos 2 mismos días (ej: 2 jueves)", "", "", "", "", ""])
     filas.append([""])
 
     # Header
@@ -523,10 +561,10 @@ def actualizar_promedios_en_sheets(sh):
         filas.append([
             item["local"],
             item["producto"],
-            item["prom_qty_diario"],
+            item["dia_semana"],
             item["stock_minimo"],
-            item["total_qty"],
-            item["dias_rango"],
+            item["fechas_usadas"],
+            item["n_dias"],
         ])
 
     # ── Escribir al sheet ──
