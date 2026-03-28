@@ -345,10 +345,12 @@ def _format_alternating_rows(ws, num_rows, num_cols):
         return
     col_letter = chr(ord('A') + num_cols - 1)
     # Filas pares (2, 4, 6...)
-    for i in range(2, num_rows + 1, 2):
+    for idx, i in enumerate(range(2, num_rows + 1, 2)):
         ws.format(f"A{i}:{col_letter}{i}", {
             "backgroundColor": COLOR_ROW_EVEN,
         })
+        if (idx + 1) % 10 == 0:
+            time.sleep(3)
 
 
 def _format_number_cols(ws, col_indices, num_rows):
@@ -591,11 +593,13 @@ def actualizar_promedios_en_sheets(sh):
             "horizontalAlignment": "CENTER",
         })
 
-    # Colorear filas alternadas
-    for i in range(header_row + 1, data_end + 1, 2):
+    # Colorear filas alternadas (con pausa cada 10 filas para evitar rate limit)
+    for idx, i in enumerate(range(header_row + 1, data_end + 1, 2)):
         ws.format(f"A{i}:{col_end}{i}", {
             "backgroundColor": COLOR_ROW_EVEN,
         })
+        if (idx + 1) % 10 == 0:
+            time.sleep(3)
 
     # Resaltar columna Stock Mínimo con fondo amarillo claro
     if data_end > header_row:
@@ -698,7 +702,7 @@ def main():
         actualizar_transacciones_en_sheets(transacciones, sh)
 
         # Actualizar Promedios por Día
-        time.sleep(2)  # Pequeña pausa para no saturar la API de Google
+        time.sleep(30)  # Pausa larga para resetear rate limit de Google Sheets API
         actualizar_promedios_en_sheets(sh)
 
         print(f"\n[{now()}] ✅ Proceso completado exitosamente.\n")
