@@ -10,8 +10,9 @@ Arquitectura:
     2. Calcula el resumen diario en Python.
     3. Pestaña "Resumen"        → histórico acumulativo (merge inteligente).
     4. Pestaña "Transacciones"  → detalle del día descargado.
-    5. Pestaña "Stock Mínimo"   → stock mínimo POR DÍA DE SEMANA = prom. qty últimos 2 mismos días.
+    5. Pestaña "Stock Mínimo"    → stock mínimo POR DÍA DE SEMANA = prom. qty últimos 3 mismos días. Con confiabilidad y outlier cap.
     6. Pestaña "Promedio x Día" → desglose diario: qty por artículo, local, fecha.
+    7. Pestaña "Top Productos"  → ranking top 20 productos por qty, global y por local, últimos 7 días.
 
 Sin Supabase. Sin VIEW. Sin dedup complejo.
 Basado en el script original de Pomodoro Consulting (Tomás).
@@ -40,6 +41,7 @@ GOOGLE_SHEET_TAB_RESUMEN = "Resumen"
 GOOGLE_SHEET_TAB_PROMEDIO = "Stock Mínimo"
 GOOGLE_SHEET_TAB_DIARIO = "Promedio x Día"
 GOOGLE_SHEET_TAB_OLD_VTA = "Vta Promedio x Dia"
+GOOGLE_SHEET_TAB_TOP = "Top Productos"
 
 # Día a consultar en modo normal.  None = ayer automáticamente.
 FECHA_ESPECIFICA = None
@@ -247,7 +249,7 @@ def calcular_stock_minimo(transacciones_ws):
       2. Suma qty por día real.
       3. Para cada día de semana (Lunes, Martes, …), toma los últimos 2
          días iguales (ej: los 2 últimos jueves).
-      4. Stock mínimo = suma de esos 2 días / 2 (promedio).
+      4. Stock mínimo = promedio de esos días (con outlier cap a 3x mediana).
     """
     # Paso 1: acumular qty por (shop, product, fecha_date)
     # {(shop, product, date_obj): total_qty}
@@ -288,26 +290,50 @@ def calcular_stock_minimo(transacciones_ws):
         wd = fecha.weekday()  # 0=Lun … 6=Dom
         por_dia_semana[(shop, product, wd)].append((fecha, qty))
 
-    # Paso 3: para cada combo, tomar los últimos 2 días y promediar
+    # Paso 3: para cada combo, tomar los últimos 3 días y promediar (con outlier cap)
     resultado = []
-    for (shop, product, wd), dias in por_dia_semana.items():
-        # Ordenar por fecha descendente y tomar los 2 más recientes
-        dias.sort(key=lambda x: x[0], reverse=True)
-        ultimos_2 = dias[:2]
 
-        if len(ultimos_2) == 0:
+    # Pre-calcular medianas por producto para outlier detection
+    producto_qtys = defaultdict(list)
+    for (shop, product, fecha), qty in ventas_dia.items():
+        producto_qtys[product].append(qty)
+    producto_mediana = {}
+    for prod, qtys in producto_qtys.items():
+        sorted_q = sorted(qtys)
+        mid = len(sorted_q) // 2
+        producto_mediana[prod] = sorted_q[mid] if len(sorted_q) % 2 else (sorted_q[mid-1] + sorted_q[mid]) / 2
+
+    for (shop, product, wd), dias in por_dia_semana.items():
+        # Ordenar por fecha descendente y tomar los 3 más recientes
+        dias.sort(key=lambda x: x[0], reverse=True)
+        ultimos = dias[:3]
+
+        if len(ultimos) == 0:
             continue
 
-        suma = sum(q for _, q in ultimos_2)
-        n = len(ultimos_2)
+        # Outlier cap: si un valor es > 3x la mediana del producto, capearlo
+        mediana = producto_mediana.get(product, 0)
+        cap = mediana * 3 if mediana > 0 else float("inf")
+        valores_capped = [min(q, cap) for _, q in ultimos]
+
+        suma = sum(valores_capped)
+        n = len(ultimos)
         promedio = suma / n
         stock_min = round(promedio)
 
         if stock_min <= 0:
             continue
 
+        # Confiabilidad basada en cantidad de días de muestra
+        if n >= 3:
+            confiabilidad = "Alta"
+        elif n == 2:
+            confiabilidad = "Media"
+        else:
+            confiabilidad = "Baja"
+
         dia_nombre = _DIAS_SEMANA[wd]
-        fechas_usadas = ", ".join(d.strftime("%d/%m") for d, _ in ultimos_2)
+        fechas_usadas = ", ".join(d.strftime("%d/%m") for d, _ in ultimos)
 
         resultado.append({
             "local": shop,
@@ -317,6 +343,7 @@ def calcular_stock_minimo(transacciones_ws):
             "stock_minimo": stock_min,
             "fechas_usadas": fechas_usadas,
             "n_dias": n,
+            "confiabilidad": confiabilidad,
         })
 
     resultado.sort(key=lambda r: (r["local"], r["producto"], r["dia_orden"]))
@@ -349,7 +376,7 @@ COLS_TRANS_DISPLAY = [
 
 COLS_STOCK_MIN = [
     "Local", "Producto", "Día",
-    "Stock Mínimo", "Fechas Usadas", "# Días",
+    "Stock Mínimo", "Fechas Usadas", "# Días", "Confiabilidad",
 ]
 
 COLS_DIARIO = [
@@ -604,8 +631,8 @@ def actualizar_promedios_en_sheets(sh):
 
     filas = []
     # Título
-    filas.append(["STOCK MÍNIMO POR DÍA DE SEMANA", "", "", "", "", ""])
-    filas.append(["Promedio qty últimos 2 mismos días (ej: 2 jueves)", "", "", "", "", ""])
+    filas.append(["STOCK MÍNIMO POR DÍA DE SEMANA", "", "", "", "", "", ""])
+    filas.append(["Promedio qty últimos 3 mismos días de semana · Confiabilidad: Alta (3d) / Media (2d) / Baja (1d)", "", "", "", "", "", ""])
     filas.append([""])
 
     # Header
@@ -616,7 +643,7 @@ def actualizar_promedios_en_sheets(sh):
     for item in stock_data:
         if item["local"] != current_local:
             if current_local is not None:
-                filas.append(["", "", "", "", "", ""])  # separador entre locales
+                filas.append(["", "", "", "", "", "", ""])  # separador entre locales
             current_local = item["local"]
         filas.append([
             item["local"],
@@ -625,6 +652,7 @@ def actualizar_promedios_en_sheets(sh):
             item["stock_minimo"],
             item["fechas_usadas"],
             item["n_dias"],
+            item["confiabilidad"],
         ])
 
     # ── Escribir al sheet ──
@@ -765,6 +793,144 @@ def actualizar_diario_en_sheets(sh):
     print(f"[{now()}] ✅ Desglose diario actualizado — {len(diario)} filas")
 
 
+
+def calcular_top_productos(transacciones_ws):
+    """
+    Calcula el ranking de productos más vendidos (por cantidad) en los últimos 7 días,
+    agrupado por local. Devuelve top 20 por local + top 20 global.
+    """
+    from datetime import timedelta
+    hoy = datetime.now().date()
+    hace_7 = hoy - timedelta(days=7)
+
+    ventas = defaultdict(lambda: defaultdict(float))  # {local: {product: qty}}
+    ventas_global = defaultdict(float)
+
+    for t in transacciones_ws:
+        tipo = str(t.get("transaction_type") or t.get("transactionType") or t.get("Tipo") or "").strip()
+        product = str(t.get("product") or t.get("Producto") or "").strip()
+        shop = str(t.get("shop") or t.get("Local") or "").strip()
+        fecha_str = str(t.get("date") or t.get("Fecha") or "").strip()
+        qty = 0
+        try:
+            qty = float(t.get("quantity") or t.get("Cantidad") or t.get("qty") or 0)
+        except (ValueError, TypeError):
+            qty = 0
+
+        if "ITEM" not in tipo.upper():
+            continue
+        if not product or product == "-" or not shop:
+            continue
+        if qty <= 0:
+            continue
+        if product.startswith("+"):
+            continue
+
+        fecha_dt = _parse_fecha(fecha_str)
+        if not fecha_dt:
+            continue
+        if fecha_dt.date() < hace_7:
+            continue
+
+        ventas[shop][product] += qty
+        ventas_global[product] += qty
+
+    resultado = {"por_local": {}, "global": []}
+
+    # Top 20 por local
+    for shop, products in sorted(ventas.items()):
+        ranking = sorted(products.items(), key=lambda x: x[1], reverse=True)[:20]
+        resultado["por_local"][shop] = [(p, round(q)) for p, q in ranking]
+
+    # Top 20 global
+    ranking_global = sorted(ventas_global.items(), key=lambda x: x[1], reverse=True)[:20]
+    resultado["global"] = [(p, round(q)) for p, q in ranking_global]
+
+    return resultado
+
+
+def actualizar_top_productos_en_sheets(sh):
+    """Genera la pestaña Top Productos con ranking semanal."""
+    print(f"[{now()}] \U0001f3c6 Calculando top productos de la semana...")
+
+    try:
+        ws_trans = sh.worksheet(GOOGLE_SHEET_TAB_TRANS)
+        all_trans = ws_trans.get_all_records()
+    except Exception as e:
+        print(f"[{now()}] \u26a0\ufe0f No se pudo leer Transacciones: {e}")
+        return
+
+    if not all_trans:
+        return
+
+    top_data = calcular_top_productos(all_trans)
+
+    filas = []
+    filas.append(["TOP PRODUCTOS - ÚLTIMOS 7 DÍAS", "", "", ""])
+    filas.append([f"Ranking por cantidad vendida · Actualizado: {now()}", "", "", ""])
+    filas.append([""])
+
+    # ── Top 20 Global ──
+    filas.append(["\U0001f30d TOP 20 GLOBAL", "", "", ""])
+    filas.append(["#", "Producto", "Qty Total", ""])
+    global_header_row = len(filas)
+    for i, (prod, qty) in enumerate(top_data["global"], 1):
+        filas.append([i, prod, qty, ""])
+    filas.append([""])
+
+    # ── Top 20 por local ──
+    local_header_rows = []
+    for shop, ranking in sorted(top_data["por_local"].items()):
+        short_name = shop.replace("LHARMONIE - ", "").replace("LHARMONIE ", "")
+        filas.append([f"\U0001f3ea {short_name.upper()}", "", "", ""])
+        filas.append(["#", "Producto", "Qty Total", ""])
+        local_header_rows.append(len(filas))
+        for i, (prod, qty) in enumerate(ranking, 1):
+            filas.append([i, prod, qty, ""])
+        filas.append([""])
+
+    # ── Escribir ──
+    total_rows = len(filas) + 5
+    ws = _get_or_create_ws(sh, GOOGLE_SHEET_TAB_TOP, rows=max(total_rows, 200), cols=5)
+    ws.clear()
+    time.sleep(1)
+    ws.resize(rows=total_rows, cols=5)
+    ws.update(filas, "A1")
+    time.sleep(1)
+
+    # Formato título
+    ws.format("A1:D1", {
+        "backgroundColor": COLOR_ACCENT,
+        "textFormat": {"bold": True, "foregroundColor": COLOR_ACCENT_FG, "fontSize": 12},
+    })
+    ws.format("A2:D2", {
+        "textFormat": {"italic": True, "foregroundColor": {"red": 0.4, "green": 0.4, "blue": 0.4}, "fontSize": 10},
+    })
+
+    # Formato headers de secciones
+    ws.format(f"A4:D4", {
+        "backgroundColor": COLOR_LIGHT_BLUE,
+        "textFormat": {"bold": True, "fontSize": 11},
+    })
+    ws.format(f"A{global_header_row}:D{global_header_row}", {
+        "backgroundColor": COLOR_HEADER_BG,
+        "textFormat": {"bold": True, "foregroundColor": COLOR_HEADER_FG},
+    })
+
+    for hr in local_header_rows:
+        ws.format(f"A{hr}:D{hr}", {
+            "backgroundColor": COLOR_HEADER_BG,
+            "textFormat": {"bold": True, "foregroundColor": COLOR_HEADER_FG},
+        })
+        # Section title (row before header)
+        ws.format(f"A{hr-1}:D{hr-1}", {
+            "backgroundColor": COLOR_LIGHT_GREEN,
+            "textFormat": {"bold": True, "fontSize": 11},
+        })
+
+    ws.freeze(rows=0)
+    print(f"[{now()}] \u2705 Top productos actualizado")
+
 def limpiar_pestana_vieja(sh):
     """Limpia la pestaña vieja 'Vta Promedio x Dia' que es redundante."""
     try:
@@ -856,6 +1022,10 @@ def main():
         actualizar_diario_en_sheets(sh)
 
         # Limpiar pestaña vieja redundante
+
+    # ── Top Productos (ranking semanal) ──
+    actualizar_top_productos_en_sheets(sh)
+
         limpiar_pestana_vieja(sh)
 
         print(f"\n[{now()}] ✅ Proceso completado exitosamente.\n")
