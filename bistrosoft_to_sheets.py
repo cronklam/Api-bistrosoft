@@ -271,6 +271,10 @@ def calcular_stock_minimo(transacciones_ws):
         if qty <= 0:
             continue
 
+        # ── Filtrar modificadores de transacción (no son productos reales) ──
+        if product.startswith("+"):
+            continue
+
         fecha_dt = _parse_fecha(fecha_str)
         if not fecha_dt:
             continue
@@ -811,7 +815,7 @@ def main():
 
         # Distribución de fechas
         dist_fechas = Counter(t.get("date", "?") for t in transacciones)
-        print(f"[{now()}] �� Fechas en respuesta: {len(dist_fechas)} días distintos, "
+        print(f"[{now()}] �� Fechas en respuesta: {len(dist_fechas)} días distintos, "
               f"{len(transacciones)} registros totales")
         for f, n in sorted(dist_fechas.items()):
             print(f"[{now()}]   {f}: {n} registros")
